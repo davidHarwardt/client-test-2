@@ -1,10 +1,5 @@
 import "./style.css";
 
-const PORT = 3000;
-
-// const uname = Deno.args[0] !== "-2" ? "user_1" : "user_2";
-// const uname = "user_1";
-const uname = (location.search ?? "?user_1").substring(1);
 
 type RtcSocketClientMessage = {
     ty: "IceCandidate",
@@ -38,12 +33,17 @@ const ICE_SERVERS = [
     {
         urls: [
             "stun:stun.l.google.com:19302",
-            "stun:stun1.l.google.com:19302",
+            // "stun:stun1.l.google.com:19302",
             // "stun:stun2.l.google.com:19302",
             // "stun:stun3.l.google.com:19302",
             // "stun:stun4.l.google.com:19302",
         ],
     },
+    // {
+    //     urls: "turn:openrelay.metered.ca:80",
+    //     username: "openrelayproject",
+    //     credential: "openrelayproject",
+    // },
 ];
 
 type DataChannelDesc = Record<string, number>;
@@ -51,13 +51,32 @@ type DataChannelDesc = Record<string, number>;
 type Connection<C> = {
     conn: RTCPeerConnection,
     name: string,
+    id: string,
     channels: Record<keyof C, RTCDataChannel>,
-    connected: boolean,
+    connection_state: ConnectionState,
 };
+
+type ConnectionState = "init" | "open" | "closed";
+
+type TypedArray = 
+    | Int8Array
+    | Uint8Array
+    | Uint8ClampedArray
+    | Int16Array
+    | Uint16Array
+    | Int32Array
+    | Uint32Array
+    | Float32Array
+    | Float64Array;
+
+type RtcMessageType = TypedArray | string | Blob | DataView;
 
 class RtcManager<C extends DataChannelDesc> {
     private _connected: boolean;
     private _sock: WebSocket;
+
+    private _room: string;
+    private _name: string;
 
     private _chan_desc: C;
     private _own_id?: string;
@@ -66,7 +85,15 @@ class RtcManager<C extends DataChannelDesc> {
     public onconnection: (conn: Connection<C>) => void = () => {};
     public onconnectionend: (conn: Connection<C>) => void = () => {};
 
-    public constructor(sock: WebSocket, chan_desc: C) {
+    private _connection_events: ((conn: Connection<C>) => void)[] = [];
+    private _connectionend_events: ((conn: Connection<C>) => void)[] = [];
+    private _msg_events: ((msg: RtcMessageType, chan: keyof C, conn: Connection<C>) => void)[] = [];
+
+    public get name() { return this._name }
+    public get room() { return this._room }
+    public get own_id() { return this._own_id }
+
+    public constructor(sock: WebSocket, name: string, room: string, chan_desc: C) {
         if(sock.readyState === sock.CLOSING || sock.readyState === sock.CLOSED) {
             throw new Error("RtcManager received already closed WebSocket");
         }
@@ -74,6 +101,8 @@ class RtcManager<C extends DataChannelDesc> {
         this._connected = sock.readyState === sock.OPEN;
         this._sock = sock;
         this._chan_desc = chan_desc;
+        this._name = name;
+        this._room = room;
 
         if(!this._connected) {
             sock.addEventListener("open", _ => {
@@ -83,6 +112,22 @@ class RtcManager<C extends DataChannelDesc> {
         } else {
             this._init_connection();
         }
+    }
+
+    public on_connection(cb: (conn: Connection<C>) => void) {
+        this._connection_events.push(cb);
+    }
+    private _on_connection(conn: Connection<C>) {
+        this.onconnection(conn);
+        for(const cb of this._connection_events) { cb(conn) }
+    }
+
+    public on_connectionend(cb: (conn: Connection<C>) => void) {
+        this._connectionend_events.push(cb);
+    }
+    private _on_connectionend(conn: Connection<C>) {
+        this.onconnectionend(conn);
+        for(const cb of this._connectionend_events) { cb(conn) }
     }
 
     private _init_connection() {
@@ -132,7 +177,7 @@ class RtcManager<C extends DataChannelDesc> {
         this._sock.send(JSON.stringify({
             ty: "Init",
             target: id,
-            name: "temp_name"
+            name: this._name,
         } as RtcSocketClientMessage));
 
         conn.addEventListener("icecandidate", ev => {
@@ -149,27 +194,35 @@ class RtcManager<C extends DataChannelDesc> {
     }
 
     private _init_conn(id: string, name: string) {
+        console.log("_init_conn message", id, name);
+
         console.log("initializing conn (_init_conn)");
         const conn = new RTCPeerConnection({
+            sdpSemantics: "unified-plan",
             iceServers: ICE_SERVERS,
-        });
+        } as any);
 
         const channels = this._init_data_channels(conn);
-        const connected = false;
-        const c = { conn, name, channels, connected };
+        const connection_state = "init";
+        const c = { conn, name, channels, connection_state, id } as Connection<C>;
         this._connections.set(id, c);
         const handler = () => {
             if(conn.connectionState === "connected") {
-                c.connected = true;
-                this.onconnection(c);
+                c.connection_state = "open";
+                this._on_connection(c);
             } else if(["disconnected", "closed", "failed"].includes(conn.connectionState)) {
-                this._connections.delete(id);
-                this.onconnectionend(c);
+                this._disconnect(id, c);
                 conn.removeEventListener("connectionstatechange", handler);
             }
         };
         conn.addEventListener("connectionstatechange", handler);
         return conn;
+    }
+
+    private _disconnect(id: string, c: Connection<C>) {
+        c.connection_state = "closed";
+        this._connections.delete(id);
+        this._on_connectionend(c);
     }
 
     private _handle_ice(id: string, candidateJson: RTCIceCandidateInit) {
@@ -216,7 +269,11 @@ class RtcManager<C extends DataChannelDesc> {
         const data_channels: Record<keyof C, RTCDataChannel> = {} as any;
         for(const k in this._chan_desc) {
             let id = this._chan_desc[k];
-            let chan = conn.createDataChannel(k, { negotiated: true, id });
+            let chan = conn.createDataChannel(k, { negotiated: true, ordered: true, id });
+            chan.addEventListener("message", ev => {
+                this._on_message(ev.data, k, this._connections.get(k)!);
+            });
+
             data_channels[k] = chan;
         }
         return data_channels;
@@ -241,33 +298,81 @@ class RtcManager<C extends DataChannelDesc> {
     public get_connections() {
         let res = [];
         for(const conn of this._connections.values()) {
-            if(conn.connected) res.push(conn);
+            if(conn.connection_state === "open") res.push(conn);
         }
         return res;
     }
+
+    public broadcast<T extends keyof C>(chan: T, data: RtcMessageType): void {
+        const connections = this.get_connections();
+        for(const conn of connections) {
+            conn.channels[chan].send(data as any);
+        }
+    }
+
+    public _on_message(msg: RtcMessageType, chan: keyof C, conn: Connection<C>) {
+        for(const cb of this._msg_events) {
+            cb(msg, chan, conn);
+        }
+    }
+
+    public on_channel_message<T extends keyof C>(chan: T, cb: (msg: RtcMessageType, conn: Connection<C>) => void) {
+        this.on_message((msg, rx_chan, conn) => { if(chan === rx_chan) cb(msg, conn) });
+    }
+
+    public on_message(cb: (msg: RtcMessageType, chan: keyof C, conn: Connection<C>) => void) {
+        this._msg_events.push(cb);
+    }
 }
 
-const sock = new WebSocket(`ws://localhost:${PORT}/ws/test_room/${uname}`);
+const PORT = 3000;
+const uname = (location.search ?? "?user_1").substring(1);
+const room = "test_room";
+
+const sock = new WebSocket(`ws://localhost:${PORT}/ws/${room}/${uname}`);
 console.log(`connecting as ${uname}`);
 
-let manager = new RtcManager(sock, { "test": 1 } as const);
+// max data channel size: 16kib (16384 bytes)
 
-manager.onconnection = (conn) => {
-    console.log(conn.conn.connectionState, "connected");
-    conn.channels.test.addEventListener("message", ev => {
-        console.log("channel message:", ev.data);
+
+function init_connection() {
+    let manager = new RtcManager(sock, uname, room, { "test": 1 } as const);
+
+    manager.on_message((msg, chan, _) => {
+        console.log(`message on channel ${chan}:`, msg);
     });
-    conn.channels.test.addEventListener("open", () => {
-        console.log("channel open");
-        conn.channels.test.send(`message from conn ${conn.name}`);
+
+    manager.on_connection((conn) => {
+        console.log(conn.conn.connectionState, "connected");
+
+        conn.channels.test.addEventListener("open", () => {
+            console.log("channel open");
+            conn.channels.test.send(`message from conn ${manager.name}`);
+            conn.channels.test.send(Uint8Array.from([1, 2, 3, 4]));
+        });
     });
-};
 
-manager.onconnectionend = (conn) => {
-    console.log("disconnected: ", conn);
-};
+    manager.on_connectionend((conn) => {
+        console.log("disconnected: ", conn);
+    });
 
-sock.addEventListener("close", _ => console.log("closing socket"));
-sock.addEventListener("error", ev => console.error("socket error", ev));
+    manager.on_connection(_ => update_joins(manager));
+    manager.on_connectionend(_ => update_joins(manager));
 
+    sock.addEventListener("close", _ => console.log("closing socket"));
+    sock.addEventListener("error", ev => console.error("socket error", ev));
+}
+
+function update_joins<T extends DataChannelDesc>(manager: RtcManager<T>) {
+    const container = document.querySelector(".user-container")!;
+    container.innerHTML = "";
+    for(const conn of manager.get_connections()) {
+        const ele = document.createElement("div");
+        ele.innerHTML = conn.name;
+        ele.classList.add("user");
+        container.appendChild(ele);
+    }
+}
+
+init_connection();
 
