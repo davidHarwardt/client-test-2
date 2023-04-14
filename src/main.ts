@@ -329,8 +329,10 @@ const PORT = 3000;
 const uname = (location.search ?? "?user_1").substring(1);
 const room = "test_room";
 
-const sock = new WebSocket(`ws://localhost:${PORT}/ws/${room}/${uname}`);
-console.log(`connecting as ${uname}`);
+let origin = location.origin.replace("https", "wss").replace("http", "ws").split(":").slice(0, 2).join(":");
+let url = `${origin}:${PORT}/ws/${room}/${uname}`;
+const sock = new WebSocket(url);
+console.log(`connecting as ${uname} to ${url}`);
 
 // max data channel size: 16kib (16384 bytes)
 
