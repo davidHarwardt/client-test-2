@@ -202,7 +202,7 @@ class RtcManager<C extends DataChannelDesc> {
             iceServers: ICE_SERVERS,
         } as any);
 
-        const channels = this._init_data_channels(conn);
+        const channels = this._init_data_channels(conn, id);
         const connection_state = "init";
         const c = { conn, name, channels, connection_state, id } as Connection<C>;
         this._connections.set(id, c);
@@ -264,14 +264,14 @@ class RtcManager<C extends DataChannelDesc> {
         } as RtcSocketClientMessage));
     }
 
-    private _init_data_channels(conn: RTCPeerConnection) {
+    private _init_data_channels(conn: RTCPeerConnection, user_id: string) {
         console.log("init connections");
         const data_channels: Record<keyof C, RTCDataChannel> = {} as any;
         for(const k in this._chan_desc) {
             let id = this._chan_desc[k];
             let chan = conn.createDataChannel(k, { negotiated: true, ordered: true, id });
             chan.addEventListener("message", ev => {
-                this._on_message(ev.data, k, this._connections.get(k)!);
+                this._on_message(ev.data, k, this._connections.get(user_id)!);
             });
 
             data_channels[k] = chan;
@@ -340,8 +340,9 @@ console.log(`connecting as ${uname} to ${url}`);
 function init_connection() {
     let manager = new RtcManager(sock, uname, room, { "test": 1 } as const);
 
-    manager.on_message((msg, chan, _) => {
+    manager.on_message((msg, chan, v) => {
         console.log(`message on channel ${chan}:`, msg);
+        console.log(v);
     });
 
     manager.on_connection((conn) => {
